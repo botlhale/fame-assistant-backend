@@ -1,32 +1,33 @@
 """
-main.py – FAME Assistant Backend
+main.py - FAME Assistant Backend Entry Point
 
-FastAPI application that exposes two endpoints:
-
-  POST /evaluate_fame   – Tier 1 deterministic FAME → Python conversion
-  POST /log_conversion  – SCD2 audit trail for conversion history
+This module initializes the FastAPI application and orchestrates the routing
+between the FAME-to-Python evaluator and the SCD Type 2 logging service.
 """
 
 from fastapi import FastAPI
-
 from api.evaluator import router as evaluator_router
 from api.logger import router as logger_router
 
 app = FastAPI(
-    title="FAME Assistant Backend",
+    title="FAME Assistant Backend (Fabric)",
     description=(
-        "Compute engine for AI-assisted FAME-to-Python code conversion. "
-        "Integrates Fame2PyGen, seriesvault (ParquetStore), and DayIDelta "
-        "(SCD2Engine) for deterministic conversion and full audit history."
+        "Orchestration engine for legacy FAME migration. "
+        "Provides deterministic conversion gates and Fabric-integrated auditing."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
 
-app.include_router(evaluator_router)
-app.include_router(logger_router)
-
+# Include sub-routers for specialized logic
+app.include_router(evaluator_router, prefix="/api/v1", tags=["Evaluation"])
+app.include_router(logger_router, prefix="/api/v1", tags=["Auditing"])
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    """Simple liveness probe."""
-    return {"status": "ok"}
+def health_check() -> dict[str, str]:
+    """
+    Performs a simple liveness probe to verify the service is running.
+    
+    Returns:
+        dict: A status indicator.
+    """
+    return {"status": "healthy"}
