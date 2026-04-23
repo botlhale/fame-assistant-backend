@@ -1,73 +1,116 @@
-import textwrap
+"""
+evaluator.py - Tier 1 Conversion Engine
+
+Logic for validating FAME formulas and generating Polars-based Python code
+integrated with the seriesvault storage layer.
+"""
+
 import re
-from fastapi import APIRouter, HTTPException
+import textwrap
+from fastapi import APIRouter
 from pydantic import BaseModel
-from fame2pygen.formulas_generator import parse_fame_formula, render_polars_expr, sanitize_func_name
+from fame2pygen.formulas_generator import parse_fame_formula, render_polars_expr #
 
 router = APIRouter()
 
 class EvaluateRequest(BaseModel):
+    """Schema for the FAME conversion request."""
     fame_code: str
 
 class EvaluateResponse(BaseModel):
+    """Schema for the conversion result and confidence score."""
     tier: int | None = None
     confidence: str
     python_code: str | None = None
 
-def _is_high_confidence(fame_code: str) -> bool:
-    """Checks for functions known to be complex/unsupported in Tier 1."""
-    complex_patterns = [r"dateof\(", r"make\(", r"contain", r"ending"]
-    return not any(re.search(p, fame_code.lower()) for p in complex_patterns)
-
-def _generate_vault_template(target: str, refs: list, polars_expr: str) -> str:
-    """Creates a runnable snippet using seriesvault and Polars."""
-    # Ensure DATE is always loaded
-    load_refs = list(set([r.upper() for r in refs] + ["DATE"]))
+def _check_confidence(fame_code: str) -> str:
+    """
+    Determines if a FAME script can be reliably converted by Tier 1 logic.
     
-    loads = "\n".join([f'    "{r}": store["{r}"],' for r in load_refs if r != target.upper()])
+    Checks for complex date functions or patterns that currently require
+    generative fallback (Tier 2).
+    
+    Args:
+        fame_code (str): The raw FAME source code.
+        
+    Returns:
+        str: "high" for simple arithmetic/mapped functions, "low" otherwise.
+    """
+    # Flag complex FAME functions for manual/generative review
+    complex_keywords = ["dateof", "make", "contain", "ending", "beginning"]
+    if any(kw in fame_code.lower() for kw in complex_keywords):
+        return "low"
+    return "high"
+
+def _generate_vault_template(target: str, refs: list[str], polars_expr: str) -> str:
+    """
+    Wraps a Polars expression in a seriesvault ParquetStore orchestration block.
+    
+    Args:
+        target (str): The variable being assigned.
+        refs (list): List of dependency variables identified by the parser.
+        polars_expr (str): The rendered Polars code string.
+        
+    Returns:
+        str: A complete Python script.
+    """
+    # Build dynamic series loading
+    load_blocks = "\n".join([f'    "{ref.upper()}": store.get_series("{ref.upper()}"),' for ref in refs])
     
     template = f"""
 import polars as pl
 from seriesvault import ParquetStore
 
-store = ParquetStore("path/to/vault")
+# Initialize the vault
+store = ParquetStore()
 
-# 1. Load dependencies from vault into a Polars DataFrame
+# Load dependencies from vault into a Polars DataFrame
 df = pl.DataFrame({{
-{loads}
+{load_blocks}
 }})
 
-# 2. Execute converted FAME logic
+# Execute the FAME-equivalent Polars logic
 df = df.with_columns([
     ({polars_expr}).alias("{target.upper()}")
 ])
 
-# 3. Persist result back to vault
+# Save the result back to the vault
 store["{target.upper()}"] = df.select(["DATE", "{target.upper()}"])
     """
     return textwrap.dedent(template).strip()
 
 @router.post("/evaluate_fame", response_model=EvaluateResponse)
-def evaluate_fame(request: EvaluateRequest):
-    # Parse the FAME formula
-    parsed = parse_fame_formula(request.fame_code)
+def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
+    """
+    Attempts to convert a FAME formula into optimized Python/Polars code.
     
-    if not parsed or not _is_high_confidence(request.fame_code):
+    If deterministic mapping is possible, returns the code and sets confidence 
+    to 'high'. If the script is too complex, returns 'low' confidence to 
+    trigger the Tier 2 generative fallback.
+    """
+    confidence = _check_confidence(request.fame_code)
+    
+    if confidence == "low":
         return EvaluateResponse(confidence="low")
-
+    
     try:
-        # Convert the RHS to a Polars expression
-        polars_expr = render_polars_expr(parsed.get("rhs", ""))
-        target = parsed.get("target", "RESULT")
-        refs = parsed.get("refs", [])
-
-        # Inject the seriesvault orchestration template
-        python_code = _generate_vault_template(target, refs, polars_expr)
-
+        # Parse the formula components
+        parsed = parse_fame_formula(request.fame_code)
+        
+        # Render the expression into Polars-compatible Python
+        polars_code = render_polars_expr(parsed["rhs"])
+        
+        # Inject into the storage template
+        final_code = _generate_vault_template(
+            target=parsed["target"],
+            refs=parsed["refs"],
+            polars_expr=polars_code
+        )
+        
         return EvaluateResponse(
             tier=1,
             confidence="high",
-            python_code=python_code
+            python_code=final_code
         )
     except Exception:
         return EvaluateResponse(confidence="low")
