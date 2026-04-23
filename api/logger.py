@@ -1,5 +1,5 @@
 """
-logger.py - Microsoft Fabric SCD Type 2 Logging
+logger.py - Microsoft Fabric SCD Type 2 Logging (Corrected)
 """
 
 from fastapi import APIRouter
@@ -18,13 +18,13 @@ class LogRequest(BaseModel):
 
 @router.post("/log_conversion")
 def log_conversion(request: LogRequest):
-    """Logs the conversion attempt to Fabric using DayIDelta SCD2 logic."""
+    """Logs the result of a conversion into a Fabric Lakehouse table."""
     spark = SparkSession.builder.getOrCreate()
     
     adapter = FabricAdapter()
     engine = SCD2Engine(adapter)
     
-    # catalog should not be None to prevent property errors
+    # catalog should be a string to ensure proper 3-level name generation
     schema = TableSchema(
         catalog="fabric", 
         schema="migration_audit",
@@ -35,7 +35,6 @@ def log_conversion(request: LogRequest):
     
     config = SCD2Config(schema="migration_audit")
     
-    # Prepare the log record for Spark processing
     log_data = [{
         "fame_code": request.fame_code,
         "python_code": request.python_code,
@@ -43,7 +42,6 @@ def log_conversion(request: LogRequest):
     }]
     source_df = spark.createDataFrame(log_data)
     
-    # Execute the SCD2 process in Fabric
     result = engine.process(spark, source_df, schema, config)
     
     return {
