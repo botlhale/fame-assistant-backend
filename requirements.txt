@@ -1,0 +1,20 @@
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+
+# Data / columnar
+polars>=0.20.0
+pyarrow>=15.0.0
+
+# Local repositories (install in development with: pip install -e <path>)
+# Assuming the three repos are checked out as siblings of this project.
+# Adjust the paths to match your local environment, or replace with git+https URLs.
+#
+#   pip install -e ../Fame2PyGen
+#   pip install -e ../DayIDelta
+#   pip install -e ../seriesvault
+#
+# Alternatively, reference them directly in this file:
+# -e ../Fame2PyGen
+# -e ../DayIDelta
+# -e ../seriesvault
