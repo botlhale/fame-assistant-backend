@@ -44,6 +44,11 @@ Start the app
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
+Verify it’s running Open:
+```bash
+http://127.0.0.1:8000/health
+or http://127.0.0.1:8000/docs (Swagger, if enabled)
+```
 🖥️ API Endpoints
 1. POST /evaluate_fame
 Evaluates a FAME script for deterministic conversion.
