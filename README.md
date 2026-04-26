@@ -39,6 +39,11 @@ pip install -e ../Fame2PyGen
 pip install -e ../DayIDelta
 pip install -e ../seriesvault
 ```
+Start the app
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+```
 🖥️ API Endpoints
 1. POST /evaluate_fame
 Evaluates a FAME script for deterministic conversion.
