@@ -1,13 +1,4 @@
-"""
-main.py - FAME Assistant Backend Entry Point
-
-This module initializes the FastAPI application and orchestrates the routing
-between the FAME-to-Python evaluator and the SCD Type 2 logging service.
-"""
-
 from fastapi import FastAPI
-from api.evaluator import router as evaluator_router
-from api.logger import router as logger_router
 
 app = FastAPI(
     title="FAME Assistant Backend (Fabric)",
@@ -18,16 +9,27 @@ app = FastAPI(
     version="0.2.0",
 )
 
-# Include sub-routers for specialized logic
-app.include_router(evaluator_router, prefix="/api/v1", tags=["Evaluation"])
-app.include_router(logger_router, prefix="/api/v1", tags=["Auditing"])
+# Keep app alive even if optional modules fail
+try:
+    from api.evaluator import router as evaluator_router
+    app.include_router(evaluator_router, prefix="/api/v1", tags=["Evaluation"])
+except Exception as e:
+    @app.get("/__router_error_evaluator")
+    def _router_error_evaluator():
+        return {"loaded": False, "error": str(e)}
+
+try:
+    from api.logger import router as logger_router
+    app.include_router(logger_router, prefix="/api/v1", tags=["Auditing"])
+except Exception as e:
+    @app.get("/__router_error_logger")
+    def _router_error_logger():
+        return {"loaded": False, "error": str(e)}
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "fame-assistant-backend"}
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
-    """
-    Performs a simple liveness probe to verify the service is running.
-    
-    Returns:
-        dict: A status indicator.
-    """
+def health_check():
     return {"status": "healthy"}
