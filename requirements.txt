@@ -7,6 +7,6 @@ pyspark>=3.5.0
 delta-spark>=3.0.0
 
 # Dependencies installed as editable links (assumes sibling directory structure)
--e ../Fame2PyGen
--e ../DayIDelta
--e ../seriesvault
+#-e ../Fame2PyGen
+#-e ../DayIDelta
+#-e ../seriesvault
