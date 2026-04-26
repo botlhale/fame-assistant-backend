@@ -30,13 +30,15 @@ This project relies on three internal libraries. Ensure these are cloned as sibl
    ```bash
    python -m venv .venv
    source .venv/bin/activate  # Windows: .venv\Scripts\activate
+   ```
 Install the backend dependencies and the local libraries in editable mode:
 
-Bash
+```bash
 pip install -r requirements.txt
 pip install -e ../Fame2PyGen
 pip install -e ../DayIDelta
 pip install -e ../seriesvault
+```
 🖥️ API Endpoints
 1. POST /evaluate_fame
 Evaluates a FAME script for deterministic conversion.
