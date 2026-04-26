@@ -1,12 +1,8 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
+gunicorn>=22.0.0
 pydantic>=2.0.0
 polars>=0.20.0
 pyarrow>=15.0.0
 pyspark>=3.5.0
 delta-spark>=3.0.0
-
-# Dependencies installed as editable links (assumes sibling directory structure)
-#-e ../Fame2PyGen
-#-e ../DayIDelta
-#-e ../seriesvault
