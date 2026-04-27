@@ -13,6 +13,7 @@ import struct
 from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Optional
+import logging
 
 import pyodbc
 from azure.identity import ClientSecretCredential
@@ -26,6 +27,7 @@ from fame2pygen.formulas_generator import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 
@@ -178,8 +180,8 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
                 confidence=confidence,
                 reason_codes=["contains_complex_keyword"],
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
 
         return EvaluateResponse(run_id=run_id, confidence="low")
 
@@ -197,8 +199,8 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
                     confidence="low",
                     reason_codes=["parse_returned_none"],
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
             return EvaluateResponse(run_id=run_id, confidence="low")
 
         polars_code = render_polars_expr(parsed["rhs"])
@@ -220,9 +222,9 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
                 confidence="high",
                 reason_codes=["tier1_conversion"],
             )
-        except Exception:
+        except Exception as e:
             # do not fail evaluation if audit write fails
-            pass
+            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
 
         return EvaluateResponse(
             run_id=run_id,
@@ -243,7 +245,7 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
                 confidence="low",
                 reason_codes=["evaluate_exception"],
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
 
         return EvaluateResponse(run_id=run_id, confidence="low")
