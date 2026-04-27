@@ -8,6 +8,7 @@ pyspark>=3.5.0
 delta-spark>=3.0.0
 pyodbc>=5.1.0
 python-dotenv>=1.0.1
+azure-identity>=1.17.1
 fame2pygen @ git+https://github.com/botlhale/Fame2PyGen.git
 dayidelta @ git+https://github.com/botlhale/DayIDelta.git
 seriesvault @ git+https://github.com/Augmenta-Systems/seriesvault.git
