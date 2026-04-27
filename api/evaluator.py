@@ -1,8 +1,9 @@
 """
-evaluator.py - Tier 1 Conversion Engine (with audit logging)
+evaluator.py - Tier 1 Conversion Engine (Copilot-friendly contract + audit logging)
 
-Validates FAME formulas and generates Polars-based Python code,
-then writes audit logs to Fabric SQL endpoint.
+- Strict, predictable JSON response contract for orchestrators/Copilot.
+- Tier-2 handoff signal when confidence is low or on error.
+- Fabric SQL audit logging with Entra SP token auth.
 """
 
 import os
@@ -12,12 +13,12 @@ import struct
 import logging
 from uuid import uuid4
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Literal
 
 import pyodbc
 from azure.identity import ClientSecretCredential
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from fame2pygen.formulas_generator import (
     parse_fame_formula,
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 SQL_COPT_SS_ACCESS_TOKEN = 1256
 
 
+# -----------------------------
+# Request / Response Contracts
+# -----------------------------
 class EvaluateRequest(BaseModel):
     fame_code: str
     tier: Optional[int] = 1
@@ -38,18 +42,34 @@ class EvaluateRequest(BaseModel):
     created_by: Optional[str] = "evaluate_fame"
 
 
+class EvaluateResult(BaseModel):
+    python_code: Optional[str] = None
+    explanations: Optional[list[str]] = None
+
+
+class EvaluateError(BaseModel):
+    code: Optional[str] = None
+    message: Optional[str] = None
+
+
 class EvaluateResponse(BaseModel):
+    status: Literal["success", "low_confidence", "error"]
     run_id: str
-    tier: int | None = None
-    confidence: str
-    python_code: str | None = None
+    result: EvaluateResult
+    next_action: Literal["none", "route_to_tier2"]
+    reason_codes: list[str] = Field(default_factory=list)
+    error: Optional[EvaluateError] = None
 
 
-def _check_confidence(fame_code: str) -> str:
+# -----------------------------
+# Core logic helpers
+# -----------------------------
+def _check_confidence(fame_code: str) -> tuple[str, list[str]]:
     complex_keywords = ["dateof", "make", "contain", "ending", "beginning"]
-    if any(kw in fame_code.lower() for kw in complex_keywords):
-        return "low"
-    return "high"
+    found = [kw for kw in complex_keywords if kw in fame_code.lower()]
+    if found:
+        return "low", ["contains_complex_keyword"]
+    return "high", ["tier1_candidate"]
 
 
 def _generate_vault_template(target: str, refs: list[str], polars_expr: str) -> str:
@@ -82,9 +102,11 @@ store["{target.upper()}"] = df.select(["DATE", "{target_sanitized}"])
     return textwrap.dedent(template).strip()
 
 
+# -----------------------------
+# Fabric SQL audit logging
+# -----------------------------
 def _get_conn() -> pyodbc.Connection:
-    # Required env vars
-    server = os.environ["FABRIC_SQL_SERVER"]       # host only, no tcp:, no ,1433
+    server = os.environ["FABRIC_SQL_SERVER"]  # host only
     database = os.environ["FABRIC_SQL_DATABASE"]
     tenant_id = os.environ["FABRIC_TENANT_ID"]
     client_id = os.environ["FABRIC_CLIENT_ID"]
@@ -118,9 +140,9 @@ def _write_audit(
     python_code: Optional[str],
     tier: Optional[int],
     status: str,
-    confidence: str,
+    confidence_score: float,
     model_used: Optional[str],
-    reason_codes: Optional[list[str]],
+    reason_codes: list[str],
     created_by: str,
 ) -> None:
     schema = os.getenv("FABRIC_SQL_SCHEMA", "dbo")
@@ -133,12 +155,10 @@ def _write_audit(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    # Your table uses VARCHAR(8000) in several columns
     fame_code_safe = (fame_code or "")[:8000]
     python_code_safe = (python_code or "")[:8000] if python_code else None
-    reason_codes_safe = json.dumps(reason_codes)[:8000] if reason_codes else None
-
-    confidence_score = 1.0 if confidence == "high" else 0.25
+    reason_codes_safe = json.dumps(reason_codes)[:8000] if reason_codes else "[]"
+    created_by_safe = (created_by or "evaluate_fame")[:100]
 
     with _get_conn() as conn:
         cur = conn.cursor()
@@ -152,66 +172,94 @@ def _write_audit(
             confidence_score,
             model_used,
             reason_codes_safe,
-            created_by[:100] if created_by else "evaluate_fame",
+            created_by_safe,
             created_utc,
         )
         conn.commit()
         cur.close()
 
 
+def _safe_audit_write(**kwargs) -> None:
+    try:
+        _write_audit(**kwargs)
+    except Exception as e:
+        logger.exception(
+            "audit_write_failed run_id=%s status=%s error=%s",
+            kwargs.get("run_id"),
+            kwargs.get("status"),
+            str(e),
+        )
+
+
+# -----------------------------
+# API endpoint
+# -----------------------------
 @router.post("/evaluate_fame", response_model=EvaluateResponse)
 def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
     run_id = f"eval-{uuid4()}"
     logger.info("evaluate_fame_start run_id=%s", run_id)
 
-    confidence = _check_confidence(request.fame_code)
+    confidence, initial_reasons = _check_confidence(request.fame_code)
 
+    # Low-confidence direct handoff path
     if confidence == "low":
-        try:
-            _write_audit(
+        reason_codes = initial_reasons
+        response = EvaluateResponse(
+            status="low_confidence",
+            run_id=run_id,
+            result=EvaluateResult(
+                python_code=None,
+                explanations=["Tier 1 confidence is low; route to Tier 2."],
+            ),
+            next_action="route_to_tier2",
+            reason_codes=reason_codes,
+            error=None,
+        )
+
+        _safe_audit_write(
+            run_id=run_id,
+            fame_code=request.fame_code,
+            python_code=None,
+            tier=request.tier,
+            status=response.status,
+            confidence_score=0.25,
+            model_used=request.model_hint,
+            reason_codes=reason_codes,
+            created_by=request.created_by or "evaluate_fame",
+        )
+
+        logger.info("evaluate_fame_low_confidence run_id=%s", run_id)
+        return response
+
+    # High-confidence conversion attempt
+    try:
+        parsed = parse_fame_formula(request.fame_code)
+        if not parsed:
+            reason_codes = ["parse_returned_none"]
+            response = EvaluateResponse(
+                status="low_confidence",
+                run_id=run_id,
+                result=EvaluateResult(
+                    python_code=None,
+                    explanations=["Parser could not confidently parse formula; route to Tier 2."],
+                ),
+                next_action="route_to_tier2",
+                reason_codes=reason_codes,
+                error=None,
+            )
+
+            _safe_audit_write(
                 run_id=run_id,
                 fame_code=request.fame_code,
                 python_code=None,
                 tier=request.tier,
-                status="low_confidence",
-                confidence="low",
+                status=response.status,
+                confidence_score=0.25,
                 model_used=request.model_hint,
-                reason_codes=["contains_complex_keyword"],
+                reason_codes=reason_codes,
                 created_by=request.created_by or "evaluate_fame",
             )
-        except Exception as e:
-            logger.exception(
-                "audit_write_failed run_id=%s status=low_confidence error=%s",
-                run_id,
-                str(e),
-            )
-
-        logger.info("evaluate_fame_low_confidence run_id=%s", run_id)
-        return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
-
-    try:
-        parsed = parse_fame_formula(request.fame_code)
-
-        if not parsed:
-            try:
-                _write_audit(
-                    run_id=run_id,
-                    fame_code=request.fame_code,
-                    python_code=None,
-                    tier=request.tier,
-                    status="parse_failed",
-                    confidence="low",
-                    model_used=request.model_hint,
-                    reason_codes=["parse_returned_none"],
-                    created_by=request.created_by or "evaluate_fame",
-                )
-            except Exception as e:
-                logger.exception(
-                    "audit_write_failed run_id=%s status=parse_failed error=%s",
-                    run_id,
-                    str(e),
-                )
-            return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
+            return response
 
         polars_code = render_polars_expr(parsed["rhs"])
         final_code = _generate_vault_template(
@@ -220,53 +268,63 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
             polars_expr=polars_code,
         )
 
-        try:
-            _write_audit(
-                run_id=run_id,
-                fame_code=request.fame_code,
-                python_code=final_code,
-                tier=request.tier or 1,
-                status="success",
-                confidence="high",
-                model_used=request.model_hint,
-                reason_codes=["tier1_conversion"],
-                created_by=request.created_by or "evaluate_fame",
-            )
-        except Exception as e:
-            logger.exception(
-                "audit_write_failed run_id=%s status=success error=%s",
-                run_id,
-                str(e),
-            )
-
-        logger.info("evaluate_fame_success run_id=%s tier=%s", run_id, request.tier or 1)
-        return EvaluateResponse(
+        reason_codes = ["tier1_conversion"]
+        response = EvaluateResponse(
+            status="success",
             run_id=run_id,
-            tier=request.tier or 1,
-            confidence="high",
-            python_code=final_code,
+            result=EvaluateResult(
+                python_code=final_code,
+                explanations=["Converted by Tier 1 deterministic parser."],
+            ),
+            next_action="none",
+            reason_codes=reason_codes,
+            error=None,
         )
+
+        _safe_audit_write(
+            run_id=run_id,
+            fame_code=request.fame_code,
+            python_code=final_code,
+            tier=request.tier or 1,
+            status=response.status,
+            confidence_score=1.0,
+            model_used=request.model_hint,
+            reason_codes=reason_codes,
+            created_by=request.created_by or "evaluate_fame",
+        )
+
+        logger.info("evaluate_fame_success run_id=%s", run_id)
+        return response
 
     except Exception as e:
         logger.exception("evaluate_fame_exception run_id=%s error=%s", run_id, str(e))
 
-        try:
-            _write_audit(
-                run_id=run_id,
-                fame_code=request.fame_code,
+        reason_codes = ["evaluate_exception"]
+        response = EvaluateResponse(
+            status="error",
+            run_id=run_id,
+            result=EvaluateResult(
                 python_code=None,
-                tier=request.tier,
-                status="exception",
-                confidence="low",
-                model_used=request.model_hint,
-                reason_codes=["evaluate_exception"],
-                created_by=request.created_by or "evaluate_fame",
-            )
-        except Exception as audit_e:
-            logger.exception(
-                "audit_write_failed run_id=%s status=exception error=%s",
-                run_id,
-                str(audit_e),
-            )
+                explanations=["Tier 1 evaluation failed unexpectedly."],
+            ),
+            next_action="route_to_tier2",
+            reason_codes=reason_codes,
+            error=EvaluateError(
+                code="E_EVALUATE_001",
+                message="Evaluation failed in Tier 1.",
+            ),
+        )
 
-        return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
+        _safe_audit_write(
+            run_id=run_id,
+            fame_code=request.fame_code,
+            python_code=None,
+            tier=request.tier,
+            status=response.status,
+            confidence_score=0.0,
+            model_used=request.model_hint,
+            reason_codes=reason_codes,
+            created_by=request.created_by or "evaluate_fame",
+        )
+
+        return response
