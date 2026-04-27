@@ -1,19 +1,18 @@
 """
 evaluator.py - Tier 1 Conversion Engine (with audit logging)
 
-Logic for validating FAME formulas and generating Polars-based Python code
-integrated with the seriesvault storage layer + Fabric SQL audit logging.
+Validates FAME formulas and generates Polars-based Python code,
+then writes audit logs to Fabric SQL endpoint.
 """
 
 import os
-import re
 import json
 import textwrap
 import struct
+import logging
 from uuid import uuid4
 from datetime import datetime, timezone
 from typing import Optional
-import logging
 
 import pyodbc
 from azure.identity import ClientSecretCredential
@@ -34,6 +33,9 @@ SQL_COPT_SS_ACCESS_TOKEN = 1256
 
 class EvaluateRequest(BaseModel):
     fame_code: str
+    tier: Optional[int] = 1
+    model_hint: Optional[str] = None
+    created_by: Optional[str] = "evaluate_fame"
 
 
 class EvaluateResponse(BaseModel):
@@ -44,7 +46,6 @@ class EvaluateResponse(BaseModel):
 
 
 def _check_confidence(fame_code: str) -> str:
-    """Determines if a FAME script can be reliably converted by Tier 1 logic."""
     complex_keywords = ["dateof", "make", "contain", "ending", "beginning"]
     if any(kw in fame_code.lower() for kw in complex_keywords):
         return "low"
@@ -52,10 +53,6 @@ def _check_confidence(fame_code: str) -> str:
 
 
 def _generate_vault_template(target: str, refs: list[str], polars_expr: str) -> str:
-    """
-    Wraps a Polars expression in a seriesvault ParquetStore block.
-    Corrected to use dictionary-style access and sanitization.
-    """
     load_blocks = "\n".join(
         [f'    "{sanitize_func_name(ref).upper()}": store["{ref.upper()}"],' for ref in refs]
     )
@@ -86,7 +83,8 @@ store["{target.upper()}"] = df.select(["DATE", "{target_sanitized}"])
 
 
 def _get_conn() -> pyodbc.Connection:
-    server = os.environ["FABRIC_SQL_SERVER"]
+    # Required env vars
+    server = os.environ["FABRIC_SQL_SERVER"]       # host only, no tcp:, no ,1433
     database = os.environ["FABRIC_SQL_DATABASE"]
     tenant_id = os.environ["FABRIC_TENANT_ID"]
     client_id = os.environ["FABRIC_CLIENT_ID"]
@@ -121,9 +119,9 @@ def _write_audit(
     tier: Optional[int],
     status: str,
     confidence: str,
-    model_used: Optional[str] = None,
-    reason_codes: Optional[list[str]] = None,
-    created_by: str = "evaluate_fame",
+    model_used: Optional[str],
+    reason_codes: Optional[list[str]],
+    created_by: str,
 ) -> None:
     schema = os.getenv("FABRIC_SQL_SCHEMA", "dbo")
     table = os.getenv("FABRIC_SQL_TABLE", "conversion_audit")
@@ -135,12 +133,11 @@ def _write_audit(
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
-    # keep within VARCHAR(8000) table limits you created
+    # Your table uses VARCHAR(8000) in several columns
     fame_code_safe = (fame_code or "")[:8000]
-    python_code_safe = (python_code or "")[:8000]
+    python_code_safe = (python_code or "")[:8000] if python_code else None
     reason_codes_safe = json.dumps(reason_codes)[:8000] if reason_codes else None
 
-    # map confidence string to numeric score
     confidence_score = 1.0 if confidence == "high" else 0.25
 
     with _get_conn() as conn:
@@ -155,7 +152,7 @@ def _write_audit(
             confidence_score,
             model_used,
             reason_codes_safe,
-            created_by,
+            created_by[:100] if created_by else "evaluate_fame",
             created_utc,
         )
         conn.commit()
@@ -164,28 +161,33 @@ def _write_audit(
 
 @router.post("/evaluate_fame", response_model=EvaluateResponse)
 def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
-    logger.info("evaluate_fame_start run_id=%s", run_id)
-    """Attempts to convert a FAME formula into optimized Python/Polars code + logs audit row."""
     run_id = f"eval-{uuid4()}"
+    logger.info("evaluate_fame_start run_id=%s", run_id)
+
     confidence = _check_confidence(request.fame_code)
 
     if confidence == "low":
-        # log low-confidence pass-through
         try:
             _write_audit(
                 run_id=run_id,
                 fame_code=request.fame_code,
                 python_code=None,
-                tier=None,
+                tier=request.tier,
                 status="low_confidence",
-                confidence=confidence,
+                confidence="low",
+                model_used=request.model_hint,
                 reason_codes=["contains_complex_keyword"],
+                created_by=request.created_by or "evaluate_fame",
             )
         except Exception as e:
-            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
-            
+            logger.exception(
+                "audit_write_failed run_id=%s status=low_confidence error=%s",
+                run_id,
+                str(e),
+            )
+
         logger.info("evaluate_fame_low_confidence run_id=%s", run_id)
-        return EvaluateResponse(run_id=run_id, confidence="low")
+        return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
 
     try:
         parsed = parse_fame_formula(request.fame_code)
@@ -196,59 +198,75 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
                     run_id=run_id,
                     fame_code=request.fame_code,
                     python_code=None,
-                    tier=None,
+                    tier=request.tier,
                     status="parse_failed",
                     confidence="low",
+                    model_used=request.model_hint,
                     reason_codes=["parse_returned_none"],
+                    created_by=request.created_by or "evaluate_fame",
                 )
             except Exception as e:
-                logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
-            return EvaluateResponse(run_id=run_id, confidence="low")
+                logger.exception(
+                    "audit_write_failed run_id=%s status=parse_failed error=%s",
+                    run_id,
+                    str(e),
+                )
+            return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
 
         polars_code = render_polars_expr(parsed["rhs"])
-
         final_code = _generate_vault_template(
             target=parsed["target"],
             refs=parsed["refs"],
             polars_expr=polars_code,
         )
 
-        # log success
         try:
             _write_audit(
                 run_id=run_id,
                 fame_code=request.fame_code,
                 python_code=final_code,
-                tier=1,
+                tier=request.tier or 1,
                 status="success",
                 confidence="high",
+                model_used=request.model_hint,
                 reason_codes=["tier1_conversion"],
+                created_by=request.created_by or "evaluate_fame",
             )
         except Exception as e:
-            # do not fail evaluation if audit write fails
-            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
+            logger.exception(
+                "audit_write_failed run_id=%s status=success error=%s",
+                run_id,
+                str(e),
+            )
 
-        logger.info("evaluate_fame_success run_id=%s tier=%s", run_id, 1)
+        logger.info("evaluate_fame_success run_id=%s tier=%s", run_id, request.tier or 1)
         return EvaluateResponse(
             run_id=run_id,
-            tier=1,
+            tier=request.tier or 1,
             confidence="high",
             python_code=final_code,
         )
 
-    except Exception:
-        # log exception outcome
+    except Exception as e:
+        logger.exception("evaluate_fame_exception run_id=%s error=%s", run_id, str(e))
+
         try:
             _write_audit(
                 run_id=run_id,
                 fame_code=request.fame_code,
                 python_code=None,
-                tier=None,
+                tier=request.tier,
                 status="exception",
                 confidence="low",
+                model_used=request.model_hint,
                 reason_codes=["evaluate_exception"],
+                created_by=request.created_by or "evaluate_fame",
             )
-        except Exception as e:
-            logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
+        except Exception as audit_e:
+            logger.exception(
+                "audit_write_failed run_id=%s status=exception error=%s",
+                run_id,
+                str(audit_e),
+            )
 
-        return EvaluateResponse(run_id=run_id, confidence="low")
+        return EvaluateResponse(run_id=run_id, tier=request.tier, confidence="low")
