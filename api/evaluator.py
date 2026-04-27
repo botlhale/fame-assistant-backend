@@ -164,6 +164,7 @@ def _write_audit(
 
 @router.post("/evaluate_fame", response_model=EvaluateResponse)
 def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
+    logger.info("evaluate_fame_start run_id=%s", run_id)
     """Attempts to convert a FAME formula into optimized Python/Polars code + logs audit row."""
     run_id = f"eval-{uuid4()}"
     confidence = _check_confidence(request.fame_code)
@@ -182,7 +183,8 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
             )
         except Exception as e:
             logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
-
+            
+        logger.info("evaluate_fame_low_confidence run_id=%s", run_id)
         return EvaluateResponse(run_id=run_id, confidence="low")
 
     try:
@@ -226,6 +228,7 @@ def evaluate_fame(request: EvaluateRequest) -> EvaluateResponse:
             # do not fail evaluation if audit write fails
             logger.exception("audit_write_failed run_id=%s status=%s error=%s", run_id, "<status_here>", str(e))
 
+        logger.info("evaluate_fame_success run_id=%s tier=%s", run_id, 1)
         return EvaluateResponse(
             run_id=run_id,
             tier=1,
