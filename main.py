@@ -7,6 +7,7 @@ app = FastAPI(
         "Provides deterministic conversion gates and Fabric-integrated auditing."
     ),
     version="0.2.0",
+    openapi_version="3.0.3",
 )
 
 evaluator_import_error = None
