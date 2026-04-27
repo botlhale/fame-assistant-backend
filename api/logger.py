@@ -6,6 +6,10 @@ from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+import struct
+from azure.identity import ClientSecretCredential
+
+SQL_COPT_SS_ACCESS_TOKEN = 1256
 
 router = APIRouter()
 
@@ -20,26 +24,33 @@ class LogConversionRequest(BaseModel):
     reason_codes: Optional[List[str]] = None
     created_by: Optional[str] = "api"
 
-def _get_conn() -> pyodbc.Connection:
-    driver = os.getenv("FABRIC_SQL_DRIVER", "ODBC Driver 18 for SQL Server")
-    server = os.environ["FABRIC_SQL_SERVER"]
+def _get_conn():
+    server = os.environ["FABRIC_SQL_SERVER"]              # host only
     database = os.environ["FABRIC_SQL_DATABASE"]
-    user = os.environ["FABRIC_SQL_USER"]
-    password = os.environ["FABRIC_SQL_PASSWORD"]
-    encrypt = os.getenv("FABRIC_SQL_ENCRYPT", "yes")
-    trust_cert = os.getenv("FABRIC_SQL_TRUST_CERT", "no")
+    tenant_id = os.environ["FABRIC_TENANT_ID"]
+    client_id = os.environ["FABRIC_CLIENT_ID"]
+    client_secret = os.environ["FABRIC_CLIENT_SECRET"]
+
+    credential = ClientSecretCredential(
+        tenant_id=tenant_id,
+        client_id=client_id,
+        client_secret=client_secret
+    )
+
+    token = credential.get_token("https://database.windows.net/.default").token
+    token_bytes = token.encode("utf-16-le")
+    token_struct = struct.pack(f"<I{len(token_bytes)}s", len(token_bytes), token_bytes)
 
     conn_str = (
-        f"DRIVER={{{driver}}};"
+        "DRIVER={ODBC Driver 18 for SQL Server};"
         f"SERVER={server};"
         f"DATABASE={database};"
-        f"UID={user};"
-        f"PWD={password};"
-        f"Encrypt={encrypt};"
-        f"TrustServerCertificate={trust_cert};"
-        f"Connection Timeout=30;"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=30;"
     )
-    return pyodbc.connect(conn_str)
+
+    return pyodbc.connect(conn_str, attrs_before={SQL_COPT_SS_ACCESS_TOKEN: token_struct})
 
 @router.post("/log_conversion")
 def log_conversion(req: LogConversionRequest):
